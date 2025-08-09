@@ -7,7 +7,7 @@ from jax import lax, debug as jax_debug
 
 @partial(
     jit,
-    static_argnames=("resistance_factor", "num_points"),
+    static_argnames=("resistance_factor"),
 )
 def ideal_string_step(
     displacement: jnp.ndarray,
@@ -19,50 +19,47 @@ def ideal_string_step(
     dt: float,
     c: float,
 ):
-    d2x = jnp.zeros(num_points, dtype=jnp.float32)
+    mask = jnp.arange(displacement.shape[0]) < num_points
+
+    d2x = jnp.zeros_like(displacement, dtype=jnp.float32)
     d2x = d2x.at[1:-1].set(
         (displacement[2:] - 2 * displacement[1:-1] + displacement[:-2]) / (dx * dx)
     )
+    d2x = jnp.where(mask, d2x, 0.0)
 
     frequency_factor = (frequency / 440.0) ** 0.3  # Adjust exponent as needed
-    resistance_factor = resistance_factor**frequency_factor
-
-    velocity = velocity * resistance_factor
+    velocity = velocity * resistance_factor**frequency_factor
     velocity = velocity + (c * c) * d2x * dt
     displacement = displacement + velocity * dt
 
     displacement = displacement.at[0].set(0.0)
-    displacement = displacement.at[-1].set(0.0)
     velocity = velocity.at[0].set(0.0)
-    velocity = velocity.at[-1].set(0.0)
+    displacement = displacement.at[num_points - 1].set(0.0)
+    velocity = velocity.at[num_points - 1].set(0.0)
 
     return displacement, velocity
 
 
 @partial(
     jit,
-    static_argnames=("resistance_factor",),
+    static_argnames=("resistance_factor"),
 )
 def ideal_string_step_scan(
     carry,
     x,
     resistance_factor: float,
-    num_points: int,
+    frequency: float,
+    num_points: jnp.ndarray,
     dx: float,
     dt: float,
     c: float,
-    frequency: float = 440.0,
-    hammer_point: float = 0.25,
-    sound_point: float = 0.75,
 ):
     displacement, velocity = carry
 
-    num_points = displacement.shape[0]
-    hammer_point = int(hammer_point * num_points)
-    sound_point = int(sound_point * num_points)
+    hammer_point = jnp.floor(num_points / 4).astype(jnp.int32)
+    sound_point = jnp.floor(3 * num_points / 4).astype(jnp.int32)
 
     displacement = displacement.at[hammer_point].add(x)
-
     displacement, velocity = ideal_string_step(
         displacement,
         velocity,
@@ -73,9 +70,7 @@ def ideal_string_step_scan(
         dt,
         c,
     )
-
     sound = displacement[sound_point]
-
     return (displacement, velocity), sound
 
 
@@ -90,6 +85,7 @@ def ideal_string_step_scan(
 )
 def render_ideal_string(
     plucks: jnp.ndarray,
+    frequency: jnp.ndarray,
     dx: jnp.ndarray,
     dt: jnp.ndarray,
     c: jnp.ndarray,
@@ -106,6 +102,7 @@ def render_ideal_string(
         partial(
             ideal_string_step_scan,
             resistance_factor=resistance_factor,
+            frequency=frequency,
             dx=dx,
             dt=dt,
             c=c,

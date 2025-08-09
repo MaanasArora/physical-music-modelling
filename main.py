@@ -1,21 +1,22 @@
+import argparse
+from time import time
+from pathlib import Path
 from piano.piano import render_piano
-from jax import jit
-from jax import numpy as jnp
-import matplotlib.pyplot as plt
+from midi.midi import read_midi_to_pianoroll
 import soundfile as sf
 
 
-def main():  # Example parameters for the ideal string
-    sample_rate = 44100
-    duration = 1.0  # seconds
-    steps_per_sample = 10
-    resistance_factor = 0.9999
+def main(midi_filename):  # Example parameters for the ideal string
+    sample_rate = 192000  # Hz
+    duration = 4.0  # seconds
+    steps_per_sample = 1
+    resistance_factor = 0.99998
     num_steps = int(sample_rate * duration * steps_per_sample)
 
-    roll = jnp.zeros((88, num_steps), dtype=jnp.float32)
-    roll = roll.at[60, :].set(1.0)
-    roll = roll.at[64, :].set(0.5)
+    roll = read_midi_to_pianoroll(midi_filename, duration)
+    print(f"Loaded piano roll with shape: {roll.shape}")
 
+    time_start = time()
     audio = render_piano(
         roll,
         sample_rate=sample_rate,
@@ -24,10 +25,18 @@ def main():  # Example parameters for the ideal string
         num_steps=num_steps,
         resistance_factor=resistance_factor,
     )
+    time_end = time()
+    print(f"Rendered audio with shape: {audio.shape}")
 
-    print("Audio shape:", audio.shape)
+    sf.write("output/piano_output.wav", audio, sample_rate)
+    print(
+        f"Rendered {audio.shape[0] / sample_rate} seconds of audio in {time_end - time_start} seconds."
+    )
 
-    sf.write('piano_output.wav', audio, sample_rate)
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Render MIDI to piano audio.")
+    parser.add_argument("midi_file", type=Path, help="Path to the MIDI file.")
+    args = parser.parse_args()
+
+    main(args.midi_file)
