@@ -1,140 +1,143 @@
 from functools import partial
+from dataclasses import dataclass
 import numpy as np
 import jax.numpy as jnp
-from jax import jit, vmap
-from jax import lax, debug as jax_debug
+import jax
+from jax import lax, tree_util
 
 
-@partial(
-    jit,
-    static_argnames=("resistance_factor"),
-)
-def ideal_string_step(
-    displacement: jnp.ndarray,
-    velocity: jnp.ndarray,
-    num_points: jnp.ndarray,
-    resistance_factor: float,
-    frequency: float,
-    dx: float,
-    dt: float,
-    c: float,
-):
-    mask = jnp.arange(displacement.shape[0]) < num_points
-
-    d2x = jnp.zeros_like(displacement, dtype=jnp.float32)
-    d2x = d2x.at[1:-1].set(
-        (displacement[2:] - 2 * displacement[1:-1] + displacement[:-2]) / (dx * dx)
-    )
-    d2x = jnp.where(mask, d2x, 0.0)
-
-    frequency_factor = (frequency / 440.0) ** 0.3  # Adjust exponent as needed
-    velocity = velocity * resistance_factor**frequency_factor
-    velocity = velocity + (c * c) * d2x * dt
-    displacement = displacement + velocity * dt
-
-    displacement = displacement.at[0].set(0.0)
-    velocity = velocity.at[0].set(0.0)
-    displacement = displacement.at[num_points - 1].set(0.0)
-    velocity = velocity.at[num_points - 1].set(0.0)
-
-    return displacement, velocity
+NUM_POINTS = 24
+PLUCK_POINT = int(NUM_POINTS * 0.25)
+BRIDGE_POINT = int(NUM_POINTS * 0.9)
+SAMPLE_RATE = 88200  # Hz
+STEPS_PER_SAMPLE = 2
+TIMESTEP = 1 / (SAMPLE_RATE * STEPS_PER_SAMPLE)
 
 
-@partial(
-    jit,
-    static_argnames=("resistance_factor"),
-)
-def ideal_string_step_scan(
-    carry,
-    x,
-    resistance_factor: float,
-    frequency: float,
-    num_points: jnp.ndarray,
-    dx: float,
-    dt: float,
-    c: float,
-):
-    displacement, velocity = carry
-
-    hammer_point = jnp.floor(num_points / 4).astype(jnp.int32)
-    sound_point = jnp.floor(3 * num_points / 4).astype(jnp.int32)
-
-    displacement = displacement.at[hammer_point].add(x)
-    displacement, velocity = ideal_string_step(
-        displacement,
-        velocity,
-        num_points,
-        resistance_factor,
-        frequency,
-        dx,
-        dt,
-        c,
-    )
-    sound = displacement[sound_point]
-    return (displacement, velocity), sound
+@jax.tree_util.register_dataclass
+@dataclass
+class PianoString:
+    length: float
+    speed: float
+    timestep: float
+    spacing: float
+    lamda: float
+    mu: float
+    damping: float
+    b1: float
+    b2: float
 
 
-@partial(
-    jit,
-    static_argnames=(
-        "resistance_factor",
-        "steps_per_sample",
-        "max_num_points",
-        "num_steps",
-    ),
-)
-def render_ideal_string(
-    plucks: jnp.ndarray,
-    frequency: jnp.ndarray,
-    dx: jnp.ndarray,
-    dt: jnp.ndarray,
-    c: jnp.ndarray,
-    num_points: jnp.ndarray,
-    max_num_points: int,
-    resistance_factor: float,
-    steps_per_sample: int = 10,
-    num_steps: int = 44100 * 10 * 10,
-):
-    displacement = jnp.zeros(max_num_points, dtype=jnp.float32)
-    velocity = jnp.zeros(max_num_points, dtype=jnp.float32)
+def _piano_string_config(
+    length: float,
+    speed: float,
+    damping: float,
+    b1: float,
+    b2: float,
+    timestep: float = 0.01,
+) -> PianoString:
+    spacing = length / NUM_POINTS
+    lamda = speed * timestep / spacing
+    mu = damping * timestep / (length * length)
 
-    _, audio = lax.scan(
-        partial(
-            ideal_string_step_scan,
-            resistance_factor=resistance_factor,
-            frequency=frequency,
-            dx=dx,
-            dt=dt,
-            c=c,
-            num_points=num_points,
-        ),
-        (displacement, velocity),
-        plucks,
-        length=num_steps,
+    return PianoString(
+        length=length,
+        speed=speed,
+        timestep=timestep,
+        spacing=spacing,
+        lamda=lamda,
+        mu=mu,
+        damping=damping,
+        b1=b1,
+        b2=b2,
     )
 
-    audio = audio[::steps_per_sample]
 
-    return audio.astype(jnp.float32)
+@jax.jit
+def _piano_string_step(
+    displacements: tuple[jnp.ndarray, jnp.ndarray], config: PianoString
+) -> jnp.ndarray:
+    lamda = config.lamda
+    mu = config.mu
+    damping = config.damping
+    timestep = config.timestep
+    b1 = config.b1
+    b2 = config.b2
+
+    denominator = 1 + b1 * timestep
+    a10 = (2 - 2 * lamda**2 - 6 * mu**2 - 4 * b2 * mu / damping) / denominator
+    a11 = (lamda**2 + 4 * mu**2 + 2 * b2 * mu / damping) / denominator
+    a12 = -(mu**2) / denominator
+    a20 = (-1 + 4 * b2 * mu / damping + b1 * timestep) / denominator
+    a21 = (2 * b2 * mu / damping) / denominator
+
+    prev_displacement, displacement = displacements
+
+    left_ext_displacement = jnp.concatenate(
+        [jnp.array([displacement[0], 0]), displacement]
+    )
+    right_ext_displacement = jnp.concatenate(
+        [displacement, jnp.array([0, displacement[-1]])]
+    )
+
+    left_displacement = left_ext_displacement[1:-1]
+    right_displacement = right_ext_displacement[1:-1]
+    left_2_displacement = left_ext_displacement[:-2]
+    right_2_displacement = right_ext_displacement[2:]
+
+    prev_left_displacement = jnp.concatenate([jnp.zeros(1), prev_displacement[:-1]])
+    prev_right_displacement = jnp.concatenate([prev_displacement[1:], jnp.zeros(1)])
+
+    new_displacement = (
+        a10 * displacement
+        + a11 * (left_displacement + right_displacement)
+        + a12 * (left_2_displacement + right_2_displacement)
+        + a20 * prev_displacement
+        + a21 * (prev_left_displacement + prev_right_displacement)
+    )
+
+    new_displacement = new_displacement.at[0].set(0)
+    new_displacement = new_displacement.at[-1].set(0)
+
+    return new_displacement
 
 
-@partial(
-    jit,
-    static_argnames=(
-        "sample_rate",
-        "steps_per_sample",
-    ),
-)
-def get_ideal_string_params(
-    tension: jnp.ndarray,
-    length: jnp.ndarray,
-    density: jnp.ndarray,
-    sample_rate: int = 44100,
-    num_points: jnp.ndarray = jnp.array(40, dtype=jnp.int32),
-    steps_per_sample: int = 10,
-):
-    c = jnp.sqrt(tension / density)
-    dx = length / (num_points - 1)
-    dt = 1.0 / (sample_rate * steps_per_sample)
+@jax.jit
+def piano_string_init(
+    config: PianoString,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    initial_displacement = jnp.zeros(NUM_POINTS)
+    return initial_displacement, initial_displacement
 
-    return dx, dt, c
+
+@jax.jit
+def piano_string_step(
+    displacements: tuple[jnp.ndarray, jnp.ndarray],
+    amplitude: jnp.ndarray | None,
+    config: PianoString,
+) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+    _, displacement = displacements
+    if amplitude is not None:
+        displacement = displacement.at[PLUCK_POINT].add(amplitude)
+    new_displacement = _piano_string_step(displacements, config)
+    return (displacement, new_displacement), new_displacement[BRIDGE_POINT]
+
+
+def get_num_samples(config: PianoString | None, duration: float) -> int:
+    return int(SAMPLE_RATE * STEPS_PER_SAMPLE * duration)
+
+
+@jax.jit
+def render_piano_string(
+    displacements: tuple[jnp.ndarray, jnp.ndarray],
+    amplitude: jnp.ndarray | None,
+    config: PianoString,
+    num_samples: int = SAMPLE_RATE * STEPS_PER_SAMPLE,
+) -> tuple[tuple[jnp.ndarray, jnp.ndarray], jnp.ndarray]:
+    (displacements), audio = lax.scan(
+        lambda c, x: piano_string_step(c, x, config),
+        displacements,
+        amplitude,
+        length=num_samples,
+    )
+    return displacements, audio[::STEPS_PER_SAMPLE]

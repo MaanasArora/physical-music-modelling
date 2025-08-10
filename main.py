@@ -1,30 +1,22 @@
 import argparse
 from time import time
 from pathlib import Path
-from piano.piano import render_piano
-from midi.midi import read_midi_to_pianoroll
+from piano.piano import render_piano_from_events, PianoConfig
+from midi.midi import read_midi_to_events
 import soundfile as sf
 
 
 def main(midi_filename):  # Example parameters for the ideal string
     sample_rate = 192000  # Hz
     duration = 4.0  # seconds
-    steps_per_sample = 1
-    resistance_factor = 0.99998
-    num_steps = int(sample_rate * duration * steps_per_sample)
 
-    roll = read_midi_to_pianoroll(midi_filename, duration)
-    print(f"Loaded piano roll with shape: {roll.shape}")
+    events = read_midi_to_events(
+        midi_filename,
+        duration=duration,
+    )
 
     time_start = time()
-    audio = render_piano(
-        roll,
-        sample_rate=sample_rate,
-        duration=duration,
-        steps_per_sample=steps_per_sample,
-        num_steps=num_steps,
-        resistance_factor=resistance_factor,
-    )
+    audio, _, _, _ = render_piano_from_events(events, duration, config=PianoConfig())
     time_end = time()
     print(f"Rendered audio with shape: {audio.shape}")
 
