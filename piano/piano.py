@@ -105,6 +105,7 @@ def render_piano_from_events(
     num_notes = max_note - min_note + 1
 
     strings = [piano_note_init(note, config) for note in range(min_note, max_note + 1)]
+
     displacements_tuple = [piano_string_init(string) for string in strings]
     displacements_prev = jnp.stack([d[0] for d in displacements_tuple])
     displacements = jnp.stack([d[1] for d in displacements_tuple])
